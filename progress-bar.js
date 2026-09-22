@@ -1,8 +1,11 @@
 /*
- * Canvas Module Progress Bar
+ * Canvas Module Progress Bar (v2)
  * Host this file on any HTTPS server and load it from your Canvas theme JavaScript.
  * It shows "Module X Progress: Step N of M (P%)" above pages, assignments,
  * discussions, and quizzes that belong to a module.
+ *
+ * Troubleshooting: set window.CMPB_DEBUG = true before loading this script
+ * (or add ?cmpb_debug=1 to the page address) to show a status box on the page.
  */
 (function () {
   'use strict';
@@ -16,12 +19,29 @@
   };
   // ------------------------------------------------------------------------
 
+  var DEBUG = window.CMPB_DEBUG === true || /[?&]cmpb_debug=1/.test(window.location.search);
+  var debugLines = [];
+
+  function log(msg) {
+    if (!DEBUG) return;
+    debugLines.push(msg);
+    var box = document.getElementById('cmpb-debug');
+    var container = document.querySelector(CONFIG.containerSelector) || document.body;
+    if (!box) {
+      box = document.createElement('pre');
+      box.id = 'cmpb-debug';
+      box.style.cssText = 'background:#fff3cd;border:2px solid #d4a017;padding:12px;white-space:pre-wrap;font-size:13px;';
+      container.insertBefore(box, container.firstChild);
+    }
+    box.textContent = 'Progress bar debug:\n' + debugLines.join('\n');
+  }
+
+  log('1. Script started (v2)');
+
   var path = window.location.pathname;
   var courseMatch = path.match(/^\/courses\/(\d+)/);
-  if (!courseMatch) return;
+  if (!courseMatch) { log('Stopped: not inside a course'); return; }
   var courseId = courseMatch[1];
-
-  if (document.getElementById('cmpb-progress')) return; // already added
 
   // Work out which item the student is looking at.
   function currentTarget() {
@@ -38,17 +58,22 @@
     return null;
   }
 
+  // Canvas sometimes prefixes JSON with "while(1);" as a security measure.
+  function parseCanvasJson(text) {
+    return JSON.parse(text.replace(/^while\(1\);/, ''));
+  }
+
   // Fetch every page of a paginated Canvas API endpoint.
   function fetchAll(url) {
     var results = [];
     function next(u) {
-      return fetch(u, { credentials: 'same-origin', headers: { Accept: 'application/json' } })
+      return fetch(u, { credentials: 'same-origin' })
         .then(function (res) {
-          if (!res.ok) throw new Error('Canvas API ' + res.status);
+          if (!res.ok) throw new Error('Canvas API returned status ' + res.status);
           var link = res.headers.get('Link') || '';
           var nextMatch = link.match(/<([^>]+)>;\s*rel="next"/);
-          return res.json().then(function (data) {
-            results = results.concat(data);
+          return res.text().then(function (text) {
+            results = results.concat(parseCanvasJson(text));
             return nextMatch ? next(nextMatch[1]) : results;
           });
         });
@@ -61,10 +86,12 @@
     try {
       var cached = JSON.parse(sessionStorage.getItem(cacheKey) || 'null');
       if (cached && Date.now() - cached.time < CONFIG.cacheMinutes * 60000) {
+        log('3. Using cached module data');
         return Promise.resolve(cached.modules);
       }
     } catch (e) { /* ignore storage errors */ }
 
+    log('3. Fetching modules from Canvas...');
     return fetchAll('/api/v1/courses/' + courseId + '/modules?include[]=items&per_page=100')
       .then(function (modules) {
         // Canvas leaves out "items" on large modules; fetch those separately.
@@ -75,9 +102,10 @@
         }));
       })
       .then(function (modules) {
+        log('4. Loaded ' + modules.length + ' modules');
         try {
           sessionStorage.setItem(cacheKey, JSON.stringify({ time: Date.now(), modules: modules }));
-        } catch (e) { /* ignore storage errors */ }
+        } catch (e) { log('   (could not cache: ' + e.message + ')'); }
         return modules;
       });
   }
@@ -91,8 +119,7 @@
 
   function findPosition(modules, target) {
     for (var i = 0; i < modules.length; i++) {
-      // Text headers are labels, not steps. Students' API results already
-      // exclude unpublished items.
+      // Text headers are labels, not steps.
       var steps = (modules[i].items || []).filter(function (it) { return it.type !== 'SubHeader'; });
       for (var j = 0; j < steps.length; j++) {
         if (matches(steps[j], target)) {
@@ -121,10 +148,7 @@
     document.head.appendChild(style);
   }
 
-  function render(pos) {
-    var container = document.querySelector(CONFIG.containerSelector);
-    if (!container || document.getElementById('cmpb-progress')) return;
-
+  function buildBar(pos) {
     var pct = Math.round((pos.step / pos.total) * 100);
     var label = moduleLabel(pos.module.name) + ' Progress: Step ' + pos.step + ' of ' + pos.total + ' (' + pct + '%)';
 
@@ -151,20 +175,54 @@
     track.appendChild(fill);
     wrap.appendChild(text);
     wrap.appendChild(track);
+    return wrap;
+  }
 
+  function insertBar(bar) {
+    if (document.getElementById('cmpb-progress')) return true;
+    var container = document.querySelector(CONFIG.containerSelector);
+    if (!container) return false;
+    var debugBox = document.getElementById('cmpb-debug');
+    var anchor = debugBox && debugBox.parentNode === container ? debugBox.nextSibling : container.firstChild;
+    container.insertBefore(bar, anchor);
+    return true;
+  }
+
+  function render(pos) {
     injectStyles();
-    container.insertBefore(wrap, container.firstChild);
+    var bar = buildBar(pos);
+    if (!insertBar(bar)) {
+      log('Stopped: could not find ' + CONFIG.containerSelector + ' on the page');
+      return;
+    }
+    log('6. Bar added: Step ' + pos.step + ' of ' + pos.total + ' in "' + pos.module.name + '"');
+
+    // Canvas sometimes redraws the page after load; put the bar back if it disappears.
+    var checks = 0;
+    var timer = setInterval(function () {
+      checks++;
+      if (!document.getElementById('cmpb-progress')) {
+        insertBar(bar);
+        log('   (bar was removed by Canvas and re-added)');
+      }
+      if (checks >= 20) clearInterval(timer);
+    }, 500);
   }
 
   function run() {
     var target = currentTarget();
-    if (!target) return;
+    if (!target) { log('Stopped: this page type is not tracked (' + path + ')'); return; }
+    log('2. Looking for: ' + JSON.stringify(target));
+
     loadModules()
       .then(function (modules) {
         var pos = findPosition(modules, target);
-        if (pos) render(pos);
+        if (!pos) { log('Stopped: this item was not found in any module'); return; }
+        log('5. Found in "' + pos.module.name + '", step ' + pos.step + ' of ' + pos.total);
+        render(pos);
       })
       .catch(function (err) {
+        log('ERROR: ' + (err && err.message ? err.message : err));
         if (window.console) console.warn('[progress-bar]', err);
       });
   }
